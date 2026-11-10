@@ -360,18 +360,68 @@ class DouYinBaseUploader(BaseVideoUploader):
         else:
             self.publish_date = 0
 
-    async def set_schedule_time_douyin(self, page, publish_date):
-        label_element = page.locator("[class^='radio']:has-text('定时发布')")
-        await label_element.click()
-        await asyncio.sleep(1)
-        publish_date_hour = publish_date.strftime("%Y-%m-%d %H:%M")
+    async def _pick_time_column(self, page, list_index: int, text: str) -> None:
+        # 时分列各有一份循环克隆。选中项由滚动容器的中线决定，滚到目标项中心再点。
+        result = await page.evaluate(
+            """([listIndex, text]) => {
+                const outer = document.querySelectorAll('.semi-scrolllist-list-outer')[listIndex];
+                const norm = (value) => (value || '').trim().replace(/[时分]/g, '');
+                const items = [...outer.querySelectorAll('li')].filter((li) => norm(li.textContent) === text);
+                if (!items.length) return {ok: false};
+                const viewMid = outer.scrollTop + outer.clientHeight / 2;
+                items.sort((a, b) => {
+                    const distance = (li) => Math.abs((li.offsetTop + li.offsetHeight / 2) - viewMid);
+                    return distance(a) - distance(b);
+                });
+                const target = items[0];
+                outer.scrollTop = target.offsetTop - (outer.clientHeight - target.offsetHeight) / 2;
+                outer.dispatchEvent(new Event('scroll', {bubbles: true}));
+                target.click();
+                return {ok: true};
+            }""",
+            [list_index, text],
+        )
+        if not result or not result.get("ok"):
+            raise RuntimeError(f"定时时间列表里没有 {text}")
+        await asyncio.sleep(0.4)
 
-        await asyncio.sleep(1)
-        await page.locator('.semi-input[placeholder="日期和时间"]').click()
-        await page.keyboard.press("Control+KeyA")
-        await page.keyboard.type(str(publish_date_hour))
-        await page.keyboard.press("Enter")
-        await asyncio.sleep(1)
+    async def set_schedule_time_douyin(self, page, publish_date):
+        # 日期框是 Semi DatePicker，直接键入不会改值，必须点日历和时分列表。
+        publish_date_hour = publish_date.strftime("%Y-%m-%d %H:%M")
+        await self._clear_blocking_overlays(page)
+        await page.evaluate(
+            """() => {
+                document.querySelectorAll('[class*="content-right"]').forEach((el) => {
+                    el.style.pointerEvents = 'none';
+                });
+            }"""
+        )
+        await page.locator("label:has-text('定时发布')").first.click()
+        date_input = page.locator('.semi-input[placeholder="日期和时间"]')
+        await date_input.click(force=True)
+        await page.locator(".semi-datepicker-day").first.wait_for(state="visible", timeout=8000)
+
+        days = page.locator(".semi-datepicker-day:not(.semi-datepicker-day-disabled)")
+        day_clicked = False
+        for index in range(await days.count()):
+            if (await days.nth(index).inner_text()).strip() == str(publish_date.day):
+                await days.nth(index).click()
+                day_clicked = True
+                break
+        if not day_clicked:
+            raise RuntimeError(f"定时日历里没有可选的 {publish_date.day} 日")
+
+        await page.locator(".semi-datepicker-switch-time").click()
+        await page.locator(".semi-datepicker-time").wait_for(state="visible", timeout=8000)
+        await self._pick_time_column(page, 0, f"{publish_date.hour:02d}")
+        await self._pick_time_column(page, 1, f"{publish_date.minute:02d}")
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
+
+        actual = (await date_input.input_value()).strip()
+        if actual != publish_date_hour:
+            raise RuntimeError(f"定时时间未写入，页面仍是 {actual}，目标 {publish_date_hour}")
+        douyin_logger.info(_msg("🕒", f"定时发布时间已设为 {actual}"))
 
     async def fill_title_and_description(self, page: Page, title: str, description: str, tags: list[str] | None = None):
         # 2026-06 抖音发布页 DOM：标题=input[placeholder*=填写作品标题]，描述=div.zone-container[contenteditable]
@@ -386,14 +436,38 @@ class DouYinBaseUploader(BaseVideoUploader):
         await page.keyboard.press("Control+KeyA")
         await page.keyboard.press("Delete")
 
-        # 先填正文描述，再填 #话题（此前 description 参数未被写入，导致抖音只有标签没有正文）
+        # 正文用逐字输入，避免一次粘贴换行被编辑器变成列表星号。
         if description and description.strip():
             await page.keyboard.type(description.strip())
 
-        for tag in tags or []:
-            await page.keyboard.type(" #" + tag)
-            await page.keyboard.press("Space")
-        await page.keyboard.press("Escape")  # 收起话题下拉，避免浮层拦截后续点击
+        # 话题整段写到文末，再关掉下拉。不能留着下拉去点封面，否则 PNAS 会被绑成推荐列表里的公司名。
+        if tags:
+            await description_editor.evaluate(
+                """(el) => {
+                    el.focus();
+                    const range = document.createRange();
+                    range.selectNodeContents(el);
+                    range.collapse(false);
+                    const sel = window.getSelection();
+                    sel.removeAllRanges();
+                    sel.addRange(range);
+                }"""
+            )
+            await page.keyboard.insert_text(" " + " ".join(f"#{tag}" for tag in tags))
+            await page.keyboard.press("Escape")
+            await page.keyboard.press("Escape")
+
+        editor_text = await description_editor.inner_text()
+        found = []
+        for part in editor_text.split("#")[1:]:
+            token = part.strip().split()[0] if part.strip() else ""
+            token = token.replace("\u200b", "").replace("\ufeff", "")
+            if token:
+                found.append(token)
+        missing = [tag for tag in (tags or []) if tag not in found]
+        if missing:
+            raise RuntimeError(f"话题没有按原文写入: {', '.join(missing)}；页面话题是 {found}")
+        await self._clear_blocking_overlays(page)
 
     async def set_location(self, page: Page, location: str = ""):
         if not location:
@@ -978,8 +1052,7 @@ class DouYinVideo(DouYinBaseUploader):
             storage_state=f"{self.account_file}",
             permissions=["geolocation"],
         )
-        context = await set_init_script(context)
-
+        # stealth.min.js 会把当前创作者中心上传页渲染成空白，文件框不出现。
         page = await context.new_page()
         await page.goto("https://creator.douyin.com/creator-micro/content/upload", wait_until="domcontentloaded", timeout=90000)
         douyin_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
@@ -989,16 +1062,16 @@ class DouYinVideo(DouYinBaseUploader):
         # ── 进入页面后可能弹身份验证（短信验证码）或被踢到登录页 ──
         await page.wait_for_timeout(2000)
 
-        # 确认已经在上传页（非登录页），再找上传 input
-        # 用更精确的选择器避免匹配到登录表单的 input
-        upload_input = page.locator("input.upload-btn-input, div[class^='container'] input[accept]").first
-        if not await upload_input.count():
-            # 兜底：排除登录页的 input
-            upload_input = page.locator("div[class^='container'] input[type='file'], div[class^='container'] input.upload-input").first
-        if not await upload_input.count():
-            # 最终兜底
-            upload_input = page.locator("div[class^='container'] input").first
-        await upload_input.wait_for(state="attached", timeout=60000)
+        # 确认已经在上传页（非登录页），再找上传 input。
+        # 当前创作者中心的文件框不在 div.container 里，先等 video file input。
+        upload_input = page.locator("input[type='file']").first
+        try:
+            await upload_input.wait_for(state="attached", timeout=30000)
+        except Exception:
+            shot = Path(BASE_DIR).parent / "assets" / "douyin-upload-missing-input.png"
+            await page.screenshot(path=str(shot), full_page=True)
+            douyin_logger.error(_msg("📸", f"上传页没有文件框，现场已截图 {shot}，当前地址 {page.url}"))
+            raise
         await upload_input.set_input_files(self.file_path)
 
         while True:
@@ -1046,10 +1119,7 @@ class DouYinVideo(DouYinBaseUploader):
             await self.set_product_link(page, self.productLink, self.productTitle)
             douyin_logger.info(_msg("🥳", "商品链接设置完成"))
 
-        # 自主声明：本项目成片含 AI 生成内容（TTS 配音 / AI 字幕 / AI 前贴片），
-        # 按平台合规如实选「内容由AI生成」（与转载等并列，单选，无二级选项、无需填来源）。
-        if not self.declaration:
-            self.declaration = "内容由AI生成"
+        # 只有调用方明确传入声明时才设置。这条测试片不是 AI 成片。
         await self.apply_self_declaration(page)
 
         # 先归集：此时尚未打开封面弹窗，避免 dy-creator-content-portal 封面浮层拦截合集下拉
@@ -1093,6 +1163,11 @@ class DouYinVideo(DouYinBaseUploader):
                         sms_prompt_logged = True
 
                 # ── 正常发布流程 ──
+                if self.publish_strategy == DOUYIN_PUBLISH_STRATEGY_SCHEDULED and self.publish_date != 0:
+                    expected = self.publish_date.strftime("%Y-%m-%d %H:%M")
+                    actual = (await page.locator('.semi-input[placeholder="日期和时间"]').input_value()).strip()
+                    if actual != expected:
+                        raise RuntimeError(f"发布前定时时间不一致，页面是 {actual}，目标 {expected}")
                 publish_button = page.get_by_role("button", name="发布", exact=True)
                 if await publish_button.count():
                     await publish_button.click(force=True)

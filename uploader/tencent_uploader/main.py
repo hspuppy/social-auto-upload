@@ -569,14 +569,27 @@ class TencentBaseUploader(BaseVideoUploader):
 
         await page.click('input[placeholder="请选择时间"]')
         await page.keyboard.press("Control+KeyA")
-        await page.keyboard.type(publish_date.strftime("%H"))
-        await page.keyboard.press("Enter")  # 确认小时并关闭时间下拉
+        await page.keyboard.press("Meta+A")
+        await page.keyboard.type(publish_date.strftime("%H:%M"))
+        await page.keyboard.press("Enter")
         await page.wait_for_timeout(500)
         # 收起时间选择浮层：直接点描述区可能被 weui-desktop-dialog 遮挡，做容错
         try:
             await page.locator("div.input-editor").click(timeout=5000)
         except Exception:
             await page.keyboard.press("Escape")
+
+        date_value = (await page.locator('input[placeholder="请选择发表时间"]').input_value()).strip()
+        time_value = (await page.locator('input[placeholder="请选择时间"]').input_value()).strip()
+        expected_time = publish_date.strftime("%H:%M")
+        day_tokens = (
+            publish_date.strftime("%Y-%m-%d"),
+            f"{publish_date.year}年{publish_date.month}月{publish_date.day}日",
+            f"{publish_date.month}月{publish_date.day}日",
+        )
+        if not any(token in date_value for token in day_tokens) or expected_time not in time_value:
+            raise RuntimeError(f"定时时间未写入，页面是 {date_value} {time_value}，目标 {publish_date.strftime('%Y-%m-%d')} {expected_time}")
+        tencent_logger.info(_msg("🕒", f"定时发布时间已设为 {date_value} {time_value}"))
 
     async def open_upload_page(self, page: Page) -> None:
         # 视频号已改版：直接全页加载 /platform/post/create 会被跳回 /platform 首页，
@@ -791,7 +804,9 @@ class TencentBaseUploader(BaseVideoUploader):
         # 视频号「视频标注」下拉：本项目成片经 AI 处理（TTS 配音、AI 字幕、AI 前贴片），
         # 依平台合规要求如实选「含AI生成内容」（与「内容为转载」等并列，选定即可、无需填写来源）。
         # 注意：这与上方独立的「声明原创」复选框是两个不同字段，本项目走 AI 标注、不勾原创声明。
-        label_text = getattr(self, "content_label", None) or "含AI生成内容"
+        label_text = getattr(self, "content_label", None)
+        if not label_text:
+            return
         try:
             entry = page.get_by_text("选择视频标注", exact=True).first
             if not await entry.count():
@@ -1013,16 +1028,15 @@ class TencentVideo(TencentBaseUploader):
 
     async def confirm_thumbnail_crop(self, page: Page) -> None:
         crop_dialog = page.locator("div.weui-desktop-dialog").filter(has_text="裁剪封面图").first
-        if not await crop_dialog.count():
+        if not await crop_dialog.count() or not await crop_dialog.is_visible():
             return
 
         try:
-            await crop_dialog.wait_for(state="visible", timeout=10000)
+            await crop_dialog.wait_for(state="visible", timeout=3000)
             crop_confirm_button = crop_dialog.locator(
                 'div.weui-desktop-dialog__ft button.weui-desktop-btn_primary:has-text("确定")'
             ).first
-            if await crop_confirm_button.count():
-                await crop_confirm_button.wait_for(state="visible", timeout=5000)
+            if await crop_confirm_button.count() and await crop_confirm_button.is_visible():
                 await crop_confirm_button.click()
                 await page.wait_for_timeout(1000)
         except Exception as exc:
@@ -1051,14 +1065,66 @@ class TencentVideo(TencentBaseUploader):
     ) -> None:
         cover_dialog = await self.open_thumbnail_dialog(page, selectors, dialog_titles)
         if not cover_dialog:
-            tencent_logger.info(_msg("🧍", f"当前页面没有出现{label}封面编辑弹窗，小人先跳过"))
-            return
+            raise RuntimeError(f"没有找到{label}封面编辑弹窗")
 
         try:
             await self.upload_thumbnail_in_dialog(page, cover_dialog, thumbnail_path)
             tencent_logger.success(_msg("🥳", f"{label}封面已经设置完成"))
         except Exception as exc:
-            tencent_logger.warning(_msg("😵", f"{label}封面设置失败，这次先跳过: {exc}"))
+            raise RuntimeError(f"{label}封面设置失败: {exc}") from exc
+
+    async def set_current_portrait_cover(self, page: Page, thumbnail_path: str) -> None:
+        # 竖屏发表页只有「个人主页和分享卡片(3:4)」。预览图还在生成时，编辑按钮点不开。
+        img = page.locator("img.cover-img-vertical").first
+        await img.wait_for(state="visible", timeout=30000)
+        for _ in range(30):
+            if await page.locator("text=生成中").count() == 0:
+                break
+            await page.wait_for_timeout(1000)
+        await img.evaluate("el => { el.style.pointerEvents = 'none'; }")
+        await page.locator("div.vertical-img-wrap div.edit-btn").first.click(force=True)
+
+        dialog = None
+        for _ in range(15):
+            candidates = page.locator("div.weui-desktop-dialog").filter(has_text="编辑封面")
+            for index in range(await candidates.count()):
+                box = await candidates.nth(index).bounding_box()
+                if box and box["height"] > 100:
+                    dialog = candidates.nth(index)
+                    break
+            if dialog is not None:
+                break
+            await page.wait_for_timeout(400)
+        if dialog is None:
+            raise RuntimeError("没有打开 3:4 封面编辑弹窗")
+
+        file_input = dialog.locator("input[type='file']").first
+        await file_input.wait_for(state="attached", timeout=10000)
+        await file_input.set_input_files(thumbnail_path)
+        await page.wait_for_timeout(1500)
+        await self.confirm_thumbnail_crop(page)
+
+        confirm = page.get_by_text("确认", exact=True)
+        clicked = False
+        for _ in range(10):
+            for index in range(await confirm.count()):
+                box = await confirm.nth(index).bounding_box()
+                if box and box["width"] > 20 and box["height"] > 10:
+                    await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                    clicked = True
+                    break
+            if clicked:
+                break
+            await page.wait_for_timeout(500)
+        if not clicked:
+            shot = Path(BASE_DIR).parent / "assets" / "tencent-cover-missing.png"
+            await page.screenshot(path=str(shot), full_page=True)
+            raise RuntimeError(f"封面弹窗里没有可点的确认，现场已截图 {shot}")
+        try:
+            await dialog.wait_for(state="hidden", timeout=10000)
+        except Exception:
+            pass
+        tencent_logger.success(_msg("🥳", "3:4 竖版封面已经设置完成"))
 
     async def set_thumbnail(self, page: Page) -> None:
         if not self.thumbnail_landscape_path and not self.thumbnail_portrait_path:
@@ -1072,13 +1138,8 @@ class TencentVideo(TencentBaseUploader):
             'div:has-text("视频号动态"):has-text("4:3")',
             'div:has-text("横版封面"):has-text("4:3")',
         ]
-        portrait_selectors = [
-            'div.vertical-cover-wrap:has-text("个人主页卡片"):has-text("3:4")',
-            'div.vertical-cover-wrap:has-text("3:4")',
-            'div.vertical-cover-wrap:has-text("个人主页卡片")',
-        ]
-
-        if self.thumbnail_landscape_path:
+        horizontal = page.locator("div.horizontal-cover-wrap").first
+        if self.thumbnail_landscape_path and await horizontal.count() and await horizontal.is_visible():
             await self.set_single_thumbnail(
                 page,
                 self.thumbnail_landscape_path,
@@ -1086,14 +1147,10 @@ class TencentVideo(TencentBaseUploader):
                 ["编辑视频号动态封面", "编辑动态封面", "编辑封面"],
                 "4:3 横版",
             )
+        elif self.thumbnail_landscape_path:
+            tencent_logger.info(_msg("🧍", "这条视频没有 4:3 封面位，跳过横版封面"))
         if self.thumbnail_portrait_path:
-            await self.set_single_thumbnail(
-                page,
-                self.thumbnail_portrait_path,
-                portrait_selectors,
-                ["编辑个人主页卡片", "编辑封面"],
-                "3:4 竖版",
-            )
+            await self.set_current_portrait_cover(page, self.thumbnail_portrait_path)
 
     async def prepare_video_for_publish(self, page: Page) -> None:
         await self.wait_for_realtime_verification(page)

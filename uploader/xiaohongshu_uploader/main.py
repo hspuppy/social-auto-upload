@@ -11,7 +11,7 @@ from patchright.async_api import Page
 from patchright.async_api import Playwright
 from patchright.async_api import async_playwright
 
-from conf import DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from conf import BASE_DIR, DEBUG_MODE, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
 from uploader.base_video import BaseVideoUploader
 from utils.base_social_media import set_init_script
 from utils.login_qrcode import build_login_qrcode_path
@@ -190,7 +190,9 @@ async def cookie_auth(account_file):
             await page.goto(
                 _build_xhs_creator_url(
                     "/publish/publish?from=homepage&target=video"
-                )
+                ),
+                wait_until="domcontentloaded",
+                timeout=90000,
             )
             await page.wait_for_timeout(3000)
 
@@ -261,7 +263,7 @@ async def xiaohongshu_cookie_gen(
         result = _build_login_result(False, "failed", "小红书登录失败", account_file)
         try:
             page = await context.new_page()
-            await page.goto(_build_xhs_creator_url("/login"))
+            await page.goto(_build_xhs_creator_url("/login"), wait_until="domcontentloaded", timeout=90000)
             qrcode_info = await _save_xhs_qrcode(page, account_file, qrcode_callback=qrcode_callback)
             qrcode_path = Path(qrcode_info["image_path"])
             xiaohongshu_logger.info(_msg("🧍", "请扫码，小人正在耐心等待登录完成"))
@@ -348,6 +350,10 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         time_input = page.locator('.d-datepicker-input-filter input.d-text')
         await time_input.fill(str(publish_date_hour))
         await asyncio.sleep(1)
+        actual = (await time_input.input_value()).strip()
+        if publish_date_hour not in actual:
+            raise RuntimeError(f"定时时间未写入，页面仍是 {actual}，目标 {publish_date_hour}")
+        xiaohongshu_logger.info(_msg("🕒", f"定时发布时间已设为 {actual}"))
 
     async def set_location(self, page: Page, location: str = "青岛市"):
         if not location:
@@ -475,6 +481,8 @@ class XiaoHongShuBaseUploader(BaseVideoUploader):
         容错：任一步失败记 warning 跳过、继续发布，不中断。
         """
         source = getattr(self, "repost_source", "") or ""
+        if not source:
+            return
         try:
             # 1. 点「添加内容类型声明」
             trigger = page.get_by_text("添加内容类型声明", exact=False).first
@@ -569,56 +577,56 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
 
         # 封面设置为增强步骤：失败时记 warning 跳过、继续发布（用视频首帧兜底）。
         try:
-            # 发布页封面区域内嵌，点击 div.upload-cover 打开封面弹窗（d-modal）。
-            cover_section = page.locator("text=设置封面").first
-            try:
-                await cover_section.scroll_into_view_if_needed(timeout=5000)
-            except Exception:
-                pass
-            await page.wait_for_timeout(2000)
+            # 视频传完后，封面区是一张首帧缩略图。悬停后点「编辑封面」，弹窗里的「上传」才是自定义封面。
+            # 第一次会弹出「封面 PK」说明，按钮不一定是 button，按文案关掉。
+            tile = page.locator(".publish-page-content-cover .default.column").first
+            edit = page.get_by_text("编辑封面", exact=True).first
+            opened = False
+            for _ in range(20):
+                tip = page.get_by_text("我知道了", exact=True)
+                if await tip.count() and await tip.first.is_visible():
+                    await tip.first.click()
+                    await page.wait_for_timeout(400)
+                if await tile.count() and await tile.is_visible():
+                    await tile.hover()
+                    await page.wait_for_timeout(300)
+                    if await edit.count() and await edit.is_visible():
+                        await edit.click()
+                        opened = True
+                        break
+                await page.wait_for_timeout(1000)
+            if not opened:
+                shot = Path(BASE_DIR).parent / "assets" / "xhs-cover-missing.png"
+                await page.screenshot(path=str(shot), full_page=True)
+                raise RuntimeError(f"没有找到封面入口，现场已截图 {shot}")
 
-            # 1. 点击 div.upload-cover 打开封面弹窗
-            upload_cover = page.locator("div.upload-cover").first
-            if not await upload_cover.count():
-                upload_cover = page.locator("div.cover-plugin-preview div.default.pointer").first
-            await upload_cover.click(force=True)
-            await page.wait_for_timeout(3000)
-
-            # 2. 切换到「上传封面」tab（默认在「截取封面」）
-            upload_tab = page.get_by_text("上传封面", exact=True).first
-            await upload_tab.wait_for(state="visible", timeout=10000)
-            await upload_tab.click()
-            await page.wait_for_timeout(2000)
-
-            # 3. 找到图片 file input（parent class: upload-wrapper）并上传
-            file_input = page.locator('div.upload-wrapper input[type="file"][accept*="image"]').first
-            if not await file_input.count():
-                file_input = page.locator('input[type="file"][accept*="image"]').last
+            file_input = page.locator("label.upload-btn input[type='file']").first
+            await file_input.wait_for(state="attached", timeout=10000)
             await file_input.set_input_files(thumbnail_path)
-            await page.wait_for_timeout(4000)  # 等图片加载+裁剪渲染
 
-            # 4. 点「确定」按钮
-            modal_footer = page.locator("div.d-modal-footer")
-            confirm = modal_footer.get_by_text("确定", exact=True).first
-            if not await confirm.count():
-                confirm = page.get_by_role("button", name="确定").first
-            await confirm.wait_for(state="visible", timeout=10000)
+            confirm = page.locator("div.d-modal button").filter(has_text="完成").first
+            enabled = False
+            for _ in range(20):
+                cls = await confirm.get_attribute("class") or ""
+                if "disabled" not in cls:
+                    enabled = True
+                    break
+                await page.wait_for_timeout(500)
+            if not enabled:
+                raise RuntimeError("封面已上传，但完成按钮没有亮起")
             await confirm.click()
-
-            # 5. 等弹窗关闭
-            modal = page.locator("div.d-modal")
             try:
-                await modal.first.wait_for(state="hidden", timeout=15000)
+                await page.locator("div.d-modal").first.wait_for(state="hidden", timeout=15000)
             except Exception:
                 pass
             xiaohongshu_logger.success(_msg("🥳", "封面已经设置完成"))
         except Exception as exc:
-            xiaohongshu_logger.warning(_msg("🖼️", f"封面设置失败，跳过该步骤继续发布（用视频首帧）：{exc}"))
             try:
                 await page.keyboard.press("Escape")
                 await page.wait_for_timeout(500)
             except Exception:
                 pass
+            raise RuntimeError(f"封面设置失败: {exc}") from exc
 
     async def upload_video_content(self, page: Page) -> None:
         xiaohongshu_logger.info(_msg("🏃", f"小人开始搬运视频: {self.title}.mp4"))
@@ -626,9 +634,12 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
         publish_url = _build_xhs_creator_url(
             "/publish/publish?from=homepage&target=video"
         )
-        await page.goto(publish_url)
+        await page.goto(publish_url, wait_until="domcontentloaded", timeout=90000)
         await page.wait_for_url(publish_url)
-        await page.locator("div[class^='upload-content'] input[class='upload-input']").set_input_files(self.file_path)
+        # 当前发布页的文件框不在 div.upload-content 里，class 是 upload-input。
+        upload_input = page.locator("input.upload-input[accept*='.mp4'], input[type='file'][accept*='.mp4']").first
+        await upload_input.wait_for(state="attached", timeout=60000)
+        await upload_input.set_input_files(self.file_path)
 
         while True:
             try:
@@ -658,9 +669,13 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
                         xiaohongshu_logger.debug(_msg("🧍", f"预览区域内容: {normalized_text}"))
                     xiaohongshu_logger.debug(_msg("🧍", "还没看到上传成功标识，小人继续等一会"))
                 else:
-                    # 尝试检查标题输入框是否已经出现，如果是，说明已经进入编辑状态
+                    cover_ready = page.locator("div.upload-cover")
+                    if self.thumbnail_path and await cover_ready.count() and await cover_ready.first.is_visible():
+                        xiaohongshu_logger.success(_msg("🥳", "封面入口已经出现，小人继续"))
+                        break
+                    # 没有自定义封面时，标题框出来就可以继续。有封面时要等入口出现，否则会点到还没渲染的区域。
                     title_container = page.locator('input[placeholder*="填写标题"]')
-                    if await title_container.count() > 0 and await title_container.is_visible():
+                    if not self.thumbnail_path and await title_container.count() > 0 and await title_container.is_visible():
                         xiaohongshu_logger.success(_msg("🥳", "虽然没看到预览区，但标题框出来了，小人继续"))
                         break
                     xiaohongshu_logger.debug(_msg("🧍", "还没拿到预览区域，小人继续等一会"))
@@ -707,8 +722,7 @@ class XiaoHongShuVideo(XiaoHongShuBaseUploader):
             permissions=["geolocation"],
             storage_state=self.account_file,
         )
-        context = await set_init_script(context)
-
+        # stealth.min.js 会把当前创作者发布页渲染成空白，文件框和定时开关都不出现。
         try:
             page = await context.new_page()
             await self.upload_video_content(page)
